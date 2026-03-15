@@ -31,7 +31,7 @@ def get_or_create_label(person_name):
     labels = load_labels()
 
     for label_id, name in labels.items():
-        if name == person_name:
+        if name.lower() == person_name.lower():
             return int(label_id), labels
 
     if labels:
@@ -42,6 +42,14 @@ def get_or_create_label(person_name):
     labels[str(new_id)] = person_name
     save_labels(labels)
     return new_id, labels
+
+
+def get_existing_label(person_name):
+    labels = load_labels()
+    for label_id, name in labels.items():
+        if name.lower() == person_name.lower():
+            return int(label_id), labels
+    return None, labels
 
 
 def detect_largest_face(gray, face_cascade):
@@ -59,17 +67,65 @@ def detect_largest_face(gray, face_cascade):
     return faces[0]
 
 
-def register_person():
+def is_blurry(img, threshold=100.0):
+    return cv2.Laplacian(img, cv2.CV_64F).var() < threshold
+
+
+def preprocess_face(face_img):
+    face_resized = cv2.resize(face_img, (200, 200))
+    face_equalized = cv2.equalizeHist(face_resized)
+    return face_equalized
+
+
+def get_next_image_index(person_dir, label_id):
+    if not os.path.exists(person_dir):
+        return 0
+
+    max_index = -1
+    prefix = f"{label_id}_"
+
+    for file_name in os.listdir(person_dir):
+        if not file_name.lower().endswith((".jpg", ".jpeg", ".png")):
+            continue
+
+        if not file_name.startswith(prefix):
+            continue
+
+        name_without_ext = os.path.splitext(file_name)[0]
+        parts = name_without_ext.split("_")
+
+        if len(parts) != 2:
+            continue
+
+        try:
+            idx = int(parts[1])
+            max_index = max(max_index, idx)
+        except ValueError:
+            continue
+
+    return max_index + 1
+
+
+def create_recognizer():
+    if not hasattr(cv2, "face"):
+        return None
+
+    return cv2.face.LBPHFaceRecognizer_create(
+        radius=1,
+        neighbors=8,
+        grid_x=8,
+        grid_y=8
+    )
+
+
+def capture_photos(person_name, label_id, target=30):
     ensure_dirs()
-    person_name = input("Nombre de la persona: ").strip()
 
-    if not person_name:
-        print("[ERROR] Nombre vacío.")
-        return
-
-    label_id, _ = get_or_create_label(person_name)
     person_dir = os.path.join(PEOPLE_DIR, person_name)
     os.makedirs(person_dir, exist_ok=True)
+
+    start_index = get_next_image_index(person_dir, label_id)
+    saved_count = 0
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
@@ -78,11 +134,10 @@ def register_person():
 
     face_cascade = cv2.CascadeClassifier(FACE_CASCADE_PATH)
 
-    count = 0
-    target = 30
-
-    print("[INFO] Registro iniciado.")
+    print(f"[INFO] Captura iniciada para: {person_name}")
+    print("[INFO] Pulsa 's' para guardar una foto cuando la cara esté bien detectada.")
     print("[INFO] Pulsa 'q' para salir.")
+    print("[INFO] Consejo: guarda fotos con distintos ángulos, luces y expresiones.")
 
     while True:
         ret, frame = cap.read()
@@ -95,42 +150,170 @@ def register_person():
 
         display = frame.copy()
 
-        cv2.putText(display, f"Persona: {person_name}", (20, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-        cv2.putText(display, f"Fotos: {count}/{target}", (20, 65),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        cv2.putText(
+            display,
+            f"Persona: {person_name}",
+            (20, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 0),
+            2
+        )
+        cv2.putText(
+            display,
+            f"Guardadas en esta sesion: {saved_count}/{target}",
+            (20, 65),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (255, 255, 255),
+            2
+        )
+        cv2.putText(
+            display,
+            "Teclas: s = guardar | q = salir",
+            (20, 100),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 255, 255),
+            2
+        )
+
+        face_processed = None
+        blur_text = "N/A"
 
         if face is not None:
             x, y, w, h = face
             cv2.rectangle(display, (x, y), (x + w, y + h), (0, 255, 0), 2)
 
-            face_roi = gray[y:y+h, x:x+w]
-            face_resized = cv2.resize(face_roi, (200, 200))
+            face_roi = gray[y:y + h, x:x + w]
+            face_processed = preprocess_face(face_roi)
 
-            if cv2.waitKey(1) & 0xFF == ord('s'):
-                img_path = os.path.join(person_dir, f"{label_id}_{count:03d}.jpg")
-                cv2.imwrite(img_path, face_resized)
-                count += 1
-                print(f"[OK] Guardada: {img_path}")
+            blurry = is_blurry(face_processed)
+            blur_text = "BORROSA" if blurry else "OK"
 
-        cv2.imshow("Registro", display)
+            cv2.putText(
+                display,
+                f"Cara detectada | Calidad: {blur_text}",
+                (20, 135),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 0) if not blurry else (0, 0, 255),
+                2
+            )
+        else:
+            cv2.putText(
+                display,
+                "No se detecta ninguna cara",
+                (20, 135),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 0, 255),
+                2
+            )
+
+        cv2.imshow("Captura de fotos", display)
 
         key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
+
+        if key == ord("q"):
             break
 
-        if count >= target:
-            print("[INFO] Registro completado.")
-            break
+        if key == ord("s"):
+            if face_processed is None:
+                print("[WARN] No hay una cara válida para guardar.")
+                continue
+
+            if is_blurry(face_processed):
+                print("[WARN] Foto borrosa, no se guarda.")
+                continue
+
+            img_index = start_index + saved_count
+            img_path = os.path.join(person_dir, f"{label_id}_{img_index:03d}.jpg")
+            cv2.imwrite(img_path, face_processed)
+            saved_count += 1
+            print(f"[OK] Guardada: {img_path}")
+
+            if saved_count >= target:
+                print("[INFO] Objetivo de fotos alcanzado.")
+                break
 
     cap.release()
     cv2.destroyAllWindows()
 
 
+def register_new_person():
+    ensure_dirs()
+    person_name = input("Nombre de la persona nueva: ").strip()
+
+    if not person_name:
+        print("[ERROR] Nombre vacío.")
+        return
+
+    existing_id, _ = get_existing_label(person_name)
+    if existing_id is not None:
+        print(f"[WARN] La persona '{person_name}' ya existe.")
+        print("[INFO] Usa la opción de añadir fotos a persona existente.")
+        return
+
+    label_id, _ = get_or_create_label(person_name)
+    capture_photos(person_name, label_id, target=30)
+
+
+def add_photos_to_existing_person():
+    ensure_dirs()
+    person_name = input("Nombre de la persona existente: ").strip()
+
+    if not person_name:
+        print("[ERROR] Nombre vacío.")
+        return
+
+    label_id, _ = get_existing_label(person_name)
+    if label_id is None:
+        print(f"[ERROR] La persona '{person_name}' no existe.")
+        print("[INFO] Primero debes registrarla.")
+        return
+
+    try:
+        target = int(input("¿Cuántas fotos quieres añadir? ").strip())
+        if target <= 0:
+            print("[ERROR] El número debe ser mayor que 0.")
+            return
+    except ValueError:
+        print("[ERROR] Debes introducir un número válido.")
+        return
+
+    capture_photos(person_name, label_id, target=target)
+
+
+def list_people():
+    labels = load_labels()
+    if not labels:
+        print("[INFO] No hay personas registradas.")
+        return
+
+    print("\n=== PERSONAS REGISTRADAS ===")
+    for label_id, name in sorted(labels.items(), key=lambda x: int(x[0])):
+        person_dir = os.path.join(PEOPLE_DIR, name)
+        img_count = 0
+
+        if os.path.exists(person_dir):
+            img_count = len([
+                f for f in os.listdir(person_dir)
+                if f.lower().endswith((".jpg", ".jpeg", ".png"))
+            ])
+
+        print(f"{label_id}: {name} ({img_count} fotos)")
+
+
 def train_model():
     ensure_dirs()
 
-    recognizer = cv2.face.LBPHFaceRecognizer_create()
+    recognizer = create_recognizer()
+    if recognizer is None:
+        print("[ERROR] Tu OpenCV no tiene el módulo 'cv2.face'.")
+        print("[INFO] Instala opencv-contrib-python y no solo opencv-python.")
+        return
+
     labels = load_labels()
 
     if not labels:
@@ -139,6 +322,9 @@ def train_model():
 
     faces = []
     ids = []
+    skipped_blurry = 0
+    skipped_small = 0
+    skipped_invalid = 0
 
     for label_id, person_name in labels.items():
         person_dir = os.path.join(PEOPLE_DIR, person_name)
@@ -153,21 +339,43 @@ def train_model():
             img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
 
             if img is None:
+                skipped_invalid += 1
+                continue
+
+            if img.shape[0] < 100 or img.shape[1] < 100:
+                skipped_small += 1
+                continue
+
+            img = preprocess_face(img)
+
+            if is_blurry(img):
+                skipped_blurry += 1
                 continue
 
             faces.append(img)
             ids.append(int(label_id))
 
     if not faces:
-        print("[ERROR] No hay imágenes para entrenar.")
+        print("[ERROR] No hay imágenes válidas para entrenar.")
         return
 
     recognizer.train(faces, np.array(ids))
     recognizer.save(MODEL_FILE)
-    print(f"[INFO] Modelo entrenado y guardado en {MODEL_FILE}")
+
+    print(f"[INFO] Modelo entrenado y guardado en: {MODEL_FILE}")
+    print(f"[INFO] Total de imágenes usadas: {len(faces)}")
+    print(f"[INFO] Imágenes descartadas por blur: {skipped_blurry}")
+    print(f"[INFO] Imágenes descartadas por tamaño: {skipped_small}")
+    print(f"[INFO] Imágenes inválidas: {skipped_invalid}")
 
 
 def recognize():
+    recognizer = create_recognizer()
+    if recognizer is None:
+        print("[ERROR] Tu OpenCV no tiene el módulo 'cv2.face'.")
+        print("[INFO] Instala opencv-contrib-python y no solo opencv-python.")
+        return
+
     if not os.path.exists(MODEL_FILE):
         print("[ERROR] No existe el modelo. Entrena primero.")
         return
@@ -175,9 +383,7 @@ def recognize():
     labels = load_labels()
     labels = {int(k): v for k, v in labels.items()}
 
-    recognizer = cv2.face.LBPHFaceRecognizer_create()
     recognizer.read(MODEL_FILE)
-
     face_cascade = cv2.CascadeClassifier(FACE_CASCADE_PATH)
 
     cap = cv2.VideoCapture(0)
@@ -185,7 +391,13 @@ def recognize():
         print("[ERROR] No se pudo abrir la cámara.")
         return
 
+    # Ajusta esto según tus pruebas:
+    # más bajo = más estricto
+    # más alto = más permisivo
+    CONFIDENCE_THRESHOLD = 55
+
     print("[INFO] Reconocimiento iniciado. Pulsa 'q' para salir.")
+    print(f"[INFO] Umbral actual: {CONFIDENCE_THRESHOLD}")
 
     while True:
         ret, frame = cap.read()
@@ -202,52 +414,113 @@ def recognize():
         )
 
         for (x, y, w, h) in faces:
-            face_roi = gray[y:y+h, x:x+w]
-            face_resized = cv2.resize(face_roi, (200, 200))
+            face_roi = gray[y:y + h, x:x + w]
+            face_processed = preprocess_face(face_roi)
 
-            label_id, confidence = recognizer.predict(face_resized)
-
-            # En LBPH, cuanto más bajo, mejor
-            if confidence < 70:
-                name = labels.get(label_id, "Desconocido")
-                color = (0, 255, 0)
-                text = f"{name} ({confidence:.1f})"
+            if is_blurry(face_processed):
+                color = (0, 165, 255)
+                text = "Cara borrosa"
             else:
-                name = "Desconocido"
-                color = (0, 0, 255)
-                text = f"{name} ({confidence:.1f})"
+                label_id, confidence = recognizer.predict(face_processed)
+                print(f"[DEBUG] label={label_id}, confidence={confidence:.2f}")
 
-            cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
-            cv2.putText(frame, text, (x, y - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+                if confidence < CONFIDENCE_THRESHOLD:
+                    name = labels.get(label_id, "Desconocido")
+                    color = (0, 255, 0)
+                    text = f"{name} ({confidence:.1f})"
+                else:
+                    color = (0, 0, 255)
+                    text = f"Desconocido ({confidence:.1f})"
+
+            cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+            cv2.putText(
+                frame,
+                text,
+                (x, y - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                color,
+                2
+            )
 
         cv2.imshow("Reconocimiento facial", frame)
 
         key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
+        if key == ord("q"):
             break
 
     cap.release()
     cv2.destroyAllWindows()
 
 
+def delete_person():
+    labels = load_labels()
+    if not labels:
+        print("[INFO] No hay personas registradas.")
+        return
+
+    list_people()
+    person_name = input("Nombre exacto de la persona a borrar: ").strip()
+
+    if not person_name:
+        print("[ERROR] Nombre vacío.")
+        return
+
+    label_id, labels = get_existing_label(person_name)
+    if label_id is None:
+        print("[ERROR] Esa persona no existe.")
+        return
+
+    confirm = input(f"¿Seguro que quieres borrar a '{person_name}'? (s/n): ").strip().lower()
+    if confirm != "s":
+        print("[INFO] Operación cancelada.")
+        return
+
+    person_dir = os.path.join(PEOPLE_DIR, person_name)
+    if os.path.exists(person_dir):
+        for file_name in os.listdir(person_dir):
+            file_path = os.path.join(person_dir, file_name)
+            if os.path.isfile(file_path):
+                os.remove(file_path)
+        try:
+            os.rmdir(person_dir)
+        except OSError:
+            pass
+
+    labels.pop(str(label_id), None)
+    save_labels(labels)
+
+    print(f"[INFO] Persona '{person_name}' eliminada.")
+    if os.path.exists(MODEL_FILE):
+        print("[INFO] Recuerda volver a entrenar el modelo.")
+
+
 def menu():
     while True:
         print("\n=== MENU ===")
-        print("1. Registrar persona")
-        print("2. Entrenar modelo")
-        print("3. Reconocer")
-        print("4. Salir")
+        print("1. Registrar persona nueva")
+        print("2. Añadir fotos a persona existente")
+        print("3. Ver personas registradas")
+        print("4. Entrenar modelo")
+        print("5. Reconocer")
+        print("6. Borrar persona")
+        print("7. Salir")
 
         option = input("Elige una opción: ").strip()
 
         if option == "1":
-            register_person()
+            register_new_person()
         elif option == "2":
-            train_model()
+            add_photos_to_existing_person()
         elif option == "3":
-            recognize()
+            list_people()
         elif option == "4":
+            train_model()
+        elif option == "5":
+            recognize()
+        elif option == "6":
+            delete_person()
+        elif option == "7":
             print("Saliendo...")
             break
         else:
