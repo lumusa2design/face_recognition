@@ -2,6 +2,9 @@ import os
 import cv2
 import json
 import numpy as np
+import time
+import easyocr
+from collections import deque, Counter
 
 DATA_DIR = "data"
 PEOPLE_DIR = os.path.join(DATA_DIR, "people")
@@ -75,6 +78,501 @@ def preprocess_face(face_img):
     face_resized = cv2.resize(face_img, (200, 200))
     face_equalized = cv2.equalizeHist(face_resized)
     return face_equalized
+
+def init_ocr_reader():
+    try:
+        return easyocr.Reader(['es', 'en'], gpu=False)
+    except Exception as e:
+        print(f"[WARN] No se pudo inicializar EasyOCR: {e}")
+        return None
+
+
+def clamp(value, min_value, max_value):
+    return max(min_value, min(value, max_value))
+
+
+def get_face_regions_for_redness(frame, face_box):
+    """
+    Regiones aproximadas: frente y mejillas.
+    """
+    x, y, w, h = face_box
+    h_img, w_img = frame.shape[:2]
+
+    def crop_safe(x1, y1, x2, y2):
+        x1 = clamp(x1, 0, w_img - 1)
+        y1 = clamp(y1, 0, h_img - 1)
+        x2 = clamp(x2, 1, w_img)
+        y2 = clamp(y2, 1, h_img)
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return frame[y1:y2, x1:x2]
+
+    forehead = crop_safe(
+        x + int(w * 0.25), y + int(h * 0.10),
+        x + int(w * 0.75), y + int(h * 0.30)
+    )
+
+    left_cheek = crop_safe(
+        x + int(w * 0.12), y + int(h * 0.45),
+        x + int(w * 0.32), y + int(h * 0.68)
+    )
+
+    right_cheek = crop_safe(
+        x + int(w * 0.68), y + int(h * 0.45),
+        x + int(w * 0.88), y + int(h * 0.68)
+    )
+
+    return forehead, left_cheek, right_cheek
+
+
+def compute_redness_score(region):
+    """
+    Índice simple de enrojecimiento visual.
+    """
+    if region is None or region.size == 0:
+        return None
+
+    mean_b = np.mean(region[:, :, 0])
+    mean_g = np.mean(region[:, :, 1])
+    mean_r = np.mean(region[:, :, 2])
+
+    score = mean_r - ((mean_g + mean_b) / 2.0)
+    return float(score)
+
+
+def analyze_face_redness(frame, face_box):
+    forehead, left_cheek, right_cheek = get_face_regions_for_redness(frame, face_box)
+
+    scores = []
+    for region in [forehead, left_cheek, right_cheek]:
+        score = compute_redness_score(region)
+        if score is not None:
+            scores.append(score)
+
+    if not scores:
+        return None, "desconocido"
+
+    avg_score = float(np.mean(scores))
+
+    if avg_score < 10:
+        level = "bajo"
+    elif avg_score < 22:
+        level = "medio"
+    else:
+        level = "alto"
+
+    return avg_score, level
+
+
+def estimate_apparent_temperature(redness_score):
+    """
+    Estimación visual MUY aproximada.
+    NO es temperatura real ni medición médica.
+    """
+    if redness_score is None:
+        return None, "sin datos"
+
+    # Base arbitraria para “temperatura aparente visual”
+    # Ajustable según tus pruebas.
+    apparent_temp = 36.0 + (redness_score / 20.0)
+
+    # Limitamos para no decir barbaridades absurdas
+    apparent_temp = max(35.0, min(39.5, apparent_temp))
+
+    if apparent_temp < 36.4:
+        label = "normal-baja"
+    elif apparent_temp < 37.3:
+        label = "normal"
+    elif apparent_temp < 38.0:
+        label = "algo elevada"
+    else:
+        label = "alta visualmente"
+
+    return apparent_temp, label
+
+
+def read_text_from_frame(reader, frame):
+    if reader is None:
+        return []
+
+    try:
+        results = reader.readtext(frame)
+        texts = []
+
+        for item in results:
+            text = item[1].strip()
+            conf = item[2]
+            if len(text) >= 2 and conf >= 0.35:
+                texts.append(text)
+
+        dedup = []
+        seen = set()
+        for t in texts:
+            key = t.lower()
+            if key not in seen:
+                seen.add(key)
+                dedup.append(t)
+
+        return dedup[:5]
+    except Exception as e:
+        print(f"[WARN] Error en OCR: {e}")
+        return []
+
+
+def describe_environment(face_count, name, ocr_texts, redness_level, apparent_temp, temp_label):
+    if face_count == 0:
+        people_desc = "No veo ninguna persona"
+    elif face_count == 1:
+        if name and name != "Desconocido":
+            people_desc = f"Veo a {name}"
+        else:
+            people_desc = "Veo una persona"
+    else:
+        people_desc = f"Veo {face_count} personas"
+
+    if ocr_texts:
+        text_desc = "Texto visible: " + ", ".join(ocr_texts[:3])
+    else:
+        text_desc = "No veo texto relevante"
+
+    if apparent_temp is not None:
+        temp_desc = f"temperatura aparente {apparent_temp:.1f}°C ({temp_label})"
+    else:
+        temp_desc = "sin estimación aparente"
+
+    return f"{people_desc}. Enrojecimiento {redness_level}. {temp_desc}. {text_desc}."
+
+
+def fit_frame_to_screen(frame, screen_w=1600, screen_h=900):
+    """
+    Escala el frame para que aproveche mejor la pantalla sin deformar.
+    """
+    h, w = frame.shape[:2]
+    scale = min(screen_w / w, screen_h / h)
+    new_w = max(1, int(w * scale))
+    new_h = max(1, int(h * scale))
+    return cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+
+def draw_multiline_text(img, lines, x=20, y=40, line_height=35,
+                        font_scale=0.9, color=(255, 255, 255), thickness=2):
+    for i, line in enumerate(lines):
+        yy = y + i * line_height
+        cv2.putText(
+            img,
+            line,
+            (x, yy),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            color,
+            thickness,
+            cv2.LINE_AA
+        )
+
+    
+def get_dominant_bgr_color(region):
+    """
+    Devuelve el color medio BGR de una región.
+    """
+    if region is None or region.size == 0:
+        return None
+
+    mean_b = float(np.mean(region[:, :, 0]))
+    mean_g = float(np.mean(region[:, :, 1]))
+    mean_r = float(np.mean(region[:, :, 2]))
+    return mean_b, mean_g, mean_r
+
+
+def classify_color_name_from_bgr(mean_b, mean_g, mean_r):
+    """
+    Clasificación muy simple de color dominante.
+    """
+    brightness = (mean_r + mean_g + mean_b) / 3.0
+
+    if brightness < 45:
+        return "negra"
+    if brightness > 210:
+        return "blanca"
+
+    max_channel = max(mean_r, mean_g, mean_b)
+    min_channel = min(mean_r, mean_g, mean_b)
+
+    # gris
+    if max_channel - min_channel < 18:
+        if brightness < 100:
+            return "gris oscura"
+        elif brightness < 170:
+            return "gris"
+        else:
+            return "gris clara"
+
+    # marrón / beige aproximados
+    if mean_r > mean_g > mean_b:
+        if brightness < 120:
+            return "marrón"
+        else:
+            return "beige"
+
+    # rojo
+    if mean_r > mean_g + 20 and mean_r > mean_b + 20:
+        return "roja"
+
+    # verde
+    if mean_g > mean_r + 15 and mean_g > mean_b + 15:
+        return "verde"
+
+    # azul
+    if mean_b > mean_r + 15 and mean_b > mean_g + 15:
+        return "azul"
+
+    # amarillo
+    if mean_r > 140 and mean_g > 140 and mean_b < 120:
+        return "amarilla"
+
+    # rosa / morado aproximados
+    if mean_r > 140 and mean_b > 120 and mean_g < 130:
+        if mean_r > mean_b:
+            return "rosa"
+        return "morada"
+
+    # naranja
+    if mean_r > 170 and mean_g > 100 and mean_g < mean_r and mean_b < 100:
+        return "naranja"
+
+    return "de color indefinido"
+
+
+def analyze_clothing(frame, face_box):
+    """
+    Mira una zona debajo de la cara para estimar el color de la ropa superior.
+    """
+    x, y, w, h = face_box
+    h_img, w_img = frame.shape[:2]
+
+    # Región aproximada del torso superior
+    tx1 = x - int(w * 0.15)
+    tx2 = x + w + int(w * 0.15)
+    ty1 = y + h
+    ty2 = y + h + int(h * 1.4)
+
+    tx1 = clamp(tx1, 0, w_img - 1)
+    tx2 = clamp(tx2, 1, w_img)
+    ty1 = clamp(ty1, 0, h_img - 1)
+    ty2 = clamp(ty2, 1, h_img)
+
+    if tx2 <= tx1 or ty2 <= ty1:
+        return "ropa no visible", None
+
+    torso_region = frame[ty1:ty2, tx1:tx2]
+    if torso_region.size == 0:
+        return "ropa no visible", None
+
+    mean_color = get_dominant_bgr_color(torso_region)
+    if mean_color is None:
+        return "ropa no visible", None
+
+    color_name = classify_color_name_from_bgr(*mean_color)
+    clothing_desc = f"parte superior {color_name}"
+
+    return clothing_desc, (tx1, ty1, tx2, ty2)
+
+
+def build_scene_summary_extended(name, face_count, redness_level, apparent_temp, temp_label, ocr_texts, clothing_desc):
+    if face_count == 0:
+        people_desc = "No veo ninguna persona"
+    elif face_count == 1:
+        if name and name != "Desconocido":
+            people_desc = f"Veo a {name}"
+        else:
+            people_desc = "Veo una persona"
+    else:
+        people_desc = f"Veo {face_count} personas"
+
+    if clothing_desc:
+        clothing_part = f"lleva {clothing_desc}"
+    else:
+        clothing_part = "no distingo bien la ropa"
+
+    if apparent_temp is not None:
+        temp_part = f"temperatura aparente {apparent_temp:.1f}°C ({temp_label})"
+    else:
+        temp_part = "sin estimación de temperatura aparente"
+
+    if ocr_texts:
+        text_part = "texto visible: " + ", ".join(ocr_texts[:3])
+    else:
+        text_part = "sin texto relevante visible"
+
+    return f"{people_desc}, {clothing_part}, enrojecimiento {redness_level}, {temp_part}, {text_part}."
+
+
+def most_common_name(history):
+    if not history:
+        return "Desconocido"
+    counter = Counter(history)
+    return counter.most_common(1)[0][0]
+
+
+def init_ocr_reader():
+    """
+    Inicializa EasyOCR una sola vez.
+    """
+    try:
+        reader = easyocr.Reader(['es', 'en'], gpu=False)
+        return reader
+    except Exception as e:
+        print(f"[WARN] No se pudo inicializar EasyOCR: {e}")
+        return None
+
+
+def clamp(value, min_value, max_value):
+    return max(min_value, min(value, max_value))
+
+
+def get_face_regions_for_redness(frame, face_box):
+    """
+    Devuelve regiones aproximadas de frente y mejillas en BGR.
+    face_box = (x, y, w, h)
+    """
+    x, y, w, h = face_box
+
+    # Frente
+    fx1 = x + int(w * 0.25)
+    fy1 = y + int(h * 0.10)
+    fx2 = x + int(w * 0.75)
+    fy2 = y + int(h * 0.30)
+
+    # Mejilla izquierda
+    lx1 = x + int(w * 0.12)
+    ly1 = y + int(h * 0.45)
+    lx2 = x + int(w * 0.32)
+    ly2 = y + int(h * 0.68)
+
+    # Mejilla derecha
+    rx1 = x + int(w * 0.68)
+    ry1 = y + int(h * 0.45)
+    rx2 = x + int(w * 0.88)
+    ry2 = y + int(h * 0.68)
+
+    h_img, w_img = frame.shape[:2]
+
+    def crop_safe(x1, y1, x2, y2):
+        x1 = clamp(x1, 0, w_img - 1)
+        y1 = clamp(y1, 0, h_img - 1)
+        x2 = clamp(x2, 1, w_img)
+        y2 = clamp(y2, 1, h_img)
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return frame[y1:y2, x1:x2]
+
+    forehead = crop_safe(fx1, fy1, fx2, fy2)
+    left_cheek = crop_safe(lx1, ly1, lx2, ly2)
+    right_cheek = crop_safe(rx1, ry1, rx2, ry2)
+
+    return forehead, left_cheek, right_cheek
+
+
+def compute_redness_score(region):
+    """
+    Calcula una métrica simple de 'enrojecimiento visual'.
+    No es temperatura. Solo color relativo.
+    """
+    if region is None or region.size == 0:
+        return None
+
+    mean_b = np.mean(region[:, :, 0])
+    mean_g = np.mean(region[:, :, 1])
+    mean_r = np.mean(region[:, :, 2])
+
+    # Índice simple: cuánto domina el rojo sobre verde/azul
+    score = mean_r - ((mean_g + mean_b) / 2.0)
+    return float(score)
+
+
+def analyze_face_redness(frame, face_box):
+    """
+    Combina frente y mejillas para sacar un redness score medio.
+    """
+    forehead, left_cheek, right_cheek = get_face_regions_for_redness(frame, face_box)
+
+    scores = []
+    for region in [forehead, left_cheek, right_cheek]:
+        score = compute_redness_score(region)
+        if score is not None:
+            scores.append(score)
+
+    if not scores:
+        return None, "desconocido"
+
+    avg_score = float(np.mean(scores))
+
+    # Estos umbrales son orientativos y hay que afinarlos con pruebas
+    if avg_score < 10:
+        level = "bajo"
+    elif avg_score < 22:
+        level = "medio"
+    else:
+        level = "alto"
+
+    return avg_score, level
+
+
+def read_text_from_frame(reader, frame):
+    """
+    OCR sobre el frame completo.
+    Devuelve una lista de textos cortos detectados.
+    """
+    if reader is None:
+        return []
+
+    try:
+        results = reader.readtext(frame)
+        texts = []
+
+        for item in results:
+            text = item[1].strip()
+            conf = item[2]
+
+            if len(text) >= 2 and conf >= 0.35:
+                texts.append(text)
+
+        # quitar duplicados conservando orden
+        dedup = []
+        seen = set()
+        for t in texts:
+            key = t.lower()
+            if key not in seen:
+                seen.add(key)
+                dedup.append(t)
+
+        return dedup[:5]
+
+    except Exception as e:
+        print(f"[WARN] Error en OCR: {e}")
+        return []
+
+
+def build_scene_summary(name, confidence, redness_level, redness_score, ocr_texts):
+    """
+    Genera una frase simple.
+    """
+    if name is None:
+        person_part = "Veo una persona"
+    elif name == "Desconocido":
+        person_part = "Veo una persona desconocida"
+    else:
+        person_part = f"Veo a {name}"
+
+    redness_part = f"enrojecimiento visual {redness_level}"
+    if redness_score is not None:
+        redness_part += f" ({redness_score:.1f})"
+
+    if ocr_texts:
+        text_part = "texto visible: " + ", ".join(ocr_texts[:3])
+    else:
+        text_part = "sin texto relevante visible"
+
+    return f"{person_part}, {redness_part}, {text_part}."
 
 
 def get_next_image_index(person_dir, label_id):
@@ -391,13 +889,28 @@ def recognize():
         print("[ERROR] No se pudo abrir la cámara.")
         return
 
-    # Ajusta esto según tus pruebas:
-    # más bajo = más estricto
-    # más alto = más permisivo
-    CONFIDENCE_THRESHOLD = 55
+    CONFIDENCE_THRESHOLD = 60
 
-    print("[INFO] Reconocimiento iniciado. Pulsa 'q' para salir.")
+    print("[INFO] Inicializando OCR...")
+    ocr_reader = init_ocr_reader()
+
+    window_name = "Reconocimiento facial + entorno"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.setWindowProperty(
+        window_name,
+        cv2.WND_PROP_FULLSCREEN,
+        cv2.WINDOW_FULLSCREEN
+    )
+
+    print("[INFO] Reconocimiento visual iniciado. Pulsa 'q' para salir.")
     print(f"[INFO] Umbral actual: {CONFIDENCE_THRESHOLD}")
+
+    last_ocr_texts = []
+    last_ocr_time = 0
+    OCR_INTERVAL = 4.0
+
+    confidence_history = deque(maxlen=10)
+    name_history = deque(maxlen=10)
 
     while True:
         ret, frame = cap.read()
@@ -406,44 +919,149 @@ def recognize():
             break
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
         faces = face_cascade.detectMultiScale(
             gray,
-            scaleFactor=1.1,
-            minNeighbors=5,
-            minSize=(120, 120)
+            scaleFactor=1.05,
+            minNeighbors=4,
+            minSize=(90, 90)
         )
 
-        for (x, y, w, h) in faces:
+        faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
+        face_count = len(faces)
+
+        # Nos quedamos con la cara principal para estabilidad
+        faces = faces[:1]
+
+        main_name = None
+        main_redness_score = None
+        main_redness_level = "desconocido"
+        main_apparent_temp = None
+        main_temp_label = "sin datos"
+        main_clothing_desc = "ropa no visible"
+
+        now = time.time()
+        if now - last_ocr_time >= OCR_INTERVAL:
+            last_ocr_texts = read_text_from_frame(ocr_reader, frame)
+            last_ocr_time = now
+
+        for i, (x, y, w, h) in enumerate(faces):
             face_roi = gray[y:y + h, x:x + w]
             face_processed = preprocess_face(face_roi)
 
+            redness_score, redness_level = analyze_face_redness(frame, (x, y, w, h))
+            apparent_temp, temp_label = estimate_apparent_temperature(redness_score)
+            clothing_desc, clothing_box = analyze_clothing(frame, (x, y, w, h))
+
             if is_blurry(face_processed):
                 color = (0, 165, 255)
-                text = "Cara borrosa"
+                name = "Cara borrosa"
+                text = f"{name} | redness: {redness_level}"
             else:
                 label_id, confidence = recognizer.predict(face_processed)
-                print(f"[DEBUG] label={label_id}, confidence={confidence:.2f}")
+                predicted_name = labels.get(label_id, "Desconocido")
 
-                if confidence < CONFIDENCE_THRESHOLD:
-                    name = labels.get(label_id, "Desconocido")
+                confidence_history.append(confidence)
+                name_history.append(
+                    predicted_name if confidence < CONFIDENCE_THRESHOLD else "Desconocido"
+                )
+
+                avg_confidence = sum(confidence_history) / len(confidence_history)
+                stable_name = most_common_name(name_history)
+
+                if stable_name != "Desconocido" and avg_confidence < CONFIDENCE_THRESHOLD:
+                    name = stable_name
                     color = (0, 255, 0)
-                    text = f"{name} ({confidence:.1f})"
                 else:
+                    name = "Desconocido"
                     color = (0, 0, 255)
-                    text = f"Desconocido ({confidence:.1f})"
+
+                temp_text = f"{apparent_temp:.1f}C" if apparent_temp is not None else "--"
+                text = (
+                    f"{name} | conf media: {avg_confidence:.1f} | "
+                    f"redness: {redness_level} | temp aparente: {temp_text}"
+                )
+
+            if i == 0:
+                main_name = name if name != "Cara borrosa" else None
+                main_redness_score = redness_score
+                main_redness_level = redness_level
+                main_apparent_temp = apparent_temp
+                main_temp_label = temp_label
+                main_clothing_desc = clothing_desc
 
             cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+
+            # Caja de ropa
+            if clothing_box is not None:
+                tx1, ty1, tx2, ty2 = clothing_box
+                cv2.rectangle(frame, (tx1, ty1), (tx2, ty2), (255, 255, 0), 1)
+
             cv2.putText(
                 frame,
                 text,
-                (x, y - 10),
+                (x, max(30, y - 10)),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
+                0.55,
                 color,
-                2
+                2,
+                cv2.LINE_AA
             )
 
-        cv2.imshow("Reconocimiento facial", frame)
+            cv2.putText(
+                frame,
+                f"Ropa: {clothing_desc}",
+                (x, min(frame.shape[0] - 20, y + h + 25)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 255, 0),
+                2,
+                cv2.LINE_AA
+            )
+
+        summary = build_scene_summary_extended(
+            main_name,
+            face_count,
+            main_redness_level,
+            main_apparent_temp,
+            main_temp_label,
+            last_ocr_texts,
+            main_clothing_desc
+        )
+
+        overlay_lines = [
+            f"Personas detectadas: {face_count}",
+            f"Persona principal: {main_name if main_name else '--'}",
+            f"Ropa detectada: {main_clothing_desc}",
+            f"Enrojecimiento: {main_redness_level}",
+            f"Temperatura aparente: "
+            f"{f'{main_apparent_temp:.1f} C ({main_temp_label})' if main_apparent_temp is not None else '--'}",
+            f"OCR: {', '.join(last_ocr_texts[:3]) if last_ocr_texts else '--'}",
+            "Resumen:",
+            summary[:140],
+            "AVISO: la temperatura aparente es solo una estimacion visual, no una medicion real.",
+            "Pulsa Q para salir"
+        ]
+
+        display = fit_frame_to_screen(frame, screen_w=1920, screen_h=1080)
+
+        overlay = display.copy()
+        cv2.rectangle(overlay, (0, 0), (display.shape[1], 330), (0, 0, 0), -1)
+        alpha = 0.48
+        display = cv2.addWeighted(overlay, alpha, display, 1 - alpha, 0)
+
+        draw_multiline_text(
+            display,
+            overlay_lines,
+            x=20,
+            y=40,
+            line_height=32,
+            font_scale=0.85,
+            color=(255, 255, 255),
+            thickness=2
+        )
+
+        cv2.imshow(window_name, display)
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
