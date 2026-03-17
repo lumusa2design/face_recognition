@@ -488,6 +488,115 @@ def compute_redness_score(region):
     score = mean_r - ((mean_g + mean_b) / 2.0)
     return float(score)
 
+def extract_skin_signal(frame, face_box):
+    """
+    Extrae una señal simple de piel usando el canal verde
+    en frente + mejillas.
+    """
+    forehead, left_cheek, right_cheek = get_face_regions_for_redness(frame, face_box)
+
+    values = []
+
+    for region in [forehead, left_cheek, right_cheek]:
+        if region is None or region.size == 0:
+            continue
+
+        # canal verde
+        green_mean = float(np.mean(region[:, :, 1]))
+        values.append(green_mean)
+
+    if not values:
+        return None
+
+    return float(np.mean(values))
+
+
+def estimate_fps_from_timestamps(timestamps):
+    if len(timestamps) < 2:
+        return None
+
+    duration = timestamps[-1] - timestamps[0]
+    if duration <= 0:
+        return None
+
+    return (len(timestamps) - 1) / duration
+
+
+def estimate_bpm_from_signal(signal_values, timestamps, min_bpm=45, max_bpm=180):
+    """
+    Estimación básica de BPM usando FFT sobre la señal temporal.
+    """
+    if len(signal_values) < 60:
+        return None, "baja"
+
+    fps = estimate_fps_from_timestamps(timestamps)
+    if fps is None or fps < 10:
+        return None, "baja"
+
+    signal = np.array(signal_values, dtype=np.float32)
+
+    # quitar media
+    signal = signal - np.mean(signal)
+
+    # si la señal es demasiado plana, no vale
+    if np.std(signal) < 0.2:
+        return None, "baja"
+
+    # ventana para suavizar bordes
+    window = np.hanning(len(signal))
+    signal_windowed = signal * window
+
+    fft = np.fft.rfft(signal_windowed)
+    freqs = np.fft.rfftfreq(len(signal_windowed), d=1.0 / fps)
+    power = np.abs(fft)
+
+    min_hz = min_bpm / 60.0
+    max_hz = max_bpm / 60.0
+
+    valid = (freqs >= min_hz) & (freqs <= max_hz)
+    if not np.any(valid):
+        return None, "baja"
+
+    valid_freqs = freqs[valid]
+    valid_power = power[valid]
+
+    if len(valid_power) == 0:
+        return None, "baja"
+
+    peak_idx = np.argmax(valid_power)
+    peak_freq = valid_freqs[peak_idx]
+    bpm = float(peak_freq * 60.0)
+
+    peak_power = valid_power[peak_idx]
+    mean_power = float(np.mean(valid_power)) + 1e-6
+    ratio = peak_power / mean_power
+
+    if ratio > 5.0:
+        quality = "alta"
+    elif ratio > 3.0:
+        quality = "media"
+    else:
+        quality = "baja"
+
+    return bpm, quality
+
+
+def smooth_numeric_history(history, new_value, maxlen=10):
+    if new_value is not None:
+        history.append(float(new_value))
+
+    if not history:
+        return None
+
+    return float(sum(history) / len(history))
+
+
+def most_common_name(history):
+    if not history:
+        return "Desconocido"
+    counter = Counter(history)
+    return counter.most_common(1)[0][0]
+
 
 def analyze_face_redness(frame, face_box):
     """
@@ -912,6 +1021,11 @@ def recognize():
     confidence_history = deque(maxlen=10)
     name_history = deque(maxlen=10)
 
+    # Historial para pulso
+    pulse_signal_history = deque(maxlen=300)     # ~10 segundos si vas a 30 fps
+    pulse_time_history = deque(maxlen=300)
+    bpm_smooth_history = deque(maxlen=8)
+
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -930,15 +1044,16 @@ def recognize():
         faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
         face_count = len(faces)
 
-        # Nos quedamos con la cara principal para estabilidad
+        # Solo cara principal para estabilidad
         faces = faces[:1]
 
         main_name = None
-        main_redness_score = None
         main_redness_level = "desconocido"
         main_apparent_temp = None
         main_temp_label = "sin datos"
         main_clothing_desc = "ropa no visible"
+        main_bpm = None
+        main_bpm_quality = "baja"
 
         now = time.time()
         if now - last_ocr_time >= OCR_INTERVAL:
@@ -953,10 +1068,25 @@ def recognize():
             apparent_temp, temp_label = estimate_apparent_temperature(redness_score)
             clothing_desc, clothing_box = analyze_clothing(frame, (x, y, w, h))
 
+            # Señal de piel para BPM
+            pulse_value = extract_skin_signal(frame, (x, y, w, h))
+            if pulse_value is not None:
+                pulse_signal_history.append(pulse_value)
+                pulse_time_history.append(time.time())
+
+            bpm, bpm_quality = estimate_bpm_from_signal(
+                pulse_signal_history,
+                pulse_time_history,
+                min_bpm=45,
+                max_bpm=180
+            )
+
+            bpm_smoothed = smooth_numeric_history(bpm_smooth_history, bpm, maxlen=8)
+
             if is_blurry(face_processed):
                 color = (0, 165, 255)
                 name = "Cara borrosa"
-                text = f"{name} | redness: {redness_level}"
+                conf_text = "--"
             else:
                 label_id, confidence = recognizer.predict(face_processed)
                 predicted_name = labels.get(label_id, "Desconocido")
@@ -976,41 +1106,54 @@ def recognize():
                     name = "Desconocido"
                     color = (0, 0, 255)
 
-                temp_text = f"{apparent_temp:.1f}C" if apparent_temp is not None else "--"
-                text = (
-                    f"{name} | conf media: {avg_confidence:.1f} | "
-                    f"redness: {redness_level} | temp aparente: {temp_text}"
-                )
+                conf_text = f"{avg_confidence:.1f}"
 
             if i == 0:
                 main_name = name if name != "Cara borrosa" else None
-                main_redness_score = redness_score
                 main_redness_level = redness_level
                 main_apparent_temp = apparent_temp
                 main_temp_label = temp_label
                 main_clothing_desc = clothing_desc
+                main_bpm = bpm_smoothed
+                main_bpm_quality = bpm_quality
 
+            # Dibujos
             cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
 
-            # Caja de ropa
             if clothing_box is not None:
                 tx1, ty1, tx2, ty2 = clothing_box
                 cv2.rectangle(frame, (tx1, ty1), (tx2, ty2), (255, 255, 0), 1)
 
+            bpm_text = f"{main_bpm:.0f}" if main_bpm is not None else "--"
+            temp_text = f"{apparent_temp:.1f}C" if apparent_temp is not None else "--"
+
+            line1 = f"{name} | conf: {conf_text}"
+            line2 = f"redness: {redness_level} | temp: {temp_text}"
+            line3 = f"ropa: {clothing_desc} | bpm: {bpm_text} ({bpm_quality})"
+
             cv2.putText(
                 frame,
-                text,
-                (x, max(30, y - 10)),
+                line1,
+                (x, max(30, y - 35)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.55,
                 color,
                 2,
                 cv2.LINE_AA
             )
-
             cv2.putText(
                 frame,
-                f"Ropa: {clothing_desc}",
+                line2,
+                (x, max(30, y - 15)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                color,
+                2,
+                cv2.LINE_AA
+            )
+            cv2.putText(
+                frame,
+                line3,
                 (x, min(frame.shape[0] - 20, y + h + 25)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.55,
@@ -1019,43 +1162,36 @@ def recognize():
                 cv2.LINE_AA
             )
 
-        summary = build_scene_summary_extended(
-            main_name,
-            face_count,
-            main_redness_level,
-            main_apparent_temp,
-            main_temp_label,
-            last_ocr_texts,
-            main_clothing_desc
-        )
-
-        overlay_lines = [
-            f"Personas detectadas: {face_count}",
-            f"Persona principal: {main_name if main_name else '--'}",
-            f"Ropa detectada: {main_clothing_desc}",
-            f"Enrojecimiento: {main_redness_level}",
-            f"Temperatura aparente: "
-            f"{f'{main_apparent_temp:.1f} C ({main_temp_label})' if main_apparent_temp is not None else '--'}",
-            f"OCR: {', '.join(last_ocr_texts[:3]) if last_ocr_texts else '--'}",
-            "Resumen:",
-            summary[:140],
-            "AVISO: la temperatura aparente es solo una estimacion visual, no una medicion real.",
-            "Pulsa Q para salir"
-        ]
-
         display = fit_frame_to_screen(frame, screen_w=1920, screen_h=1080)
 
         overlay = display.copy()
-        cv2.rectangle(overlay, (0, 0), (display.shape[1], 330), (0, 0, 0), -1)
-        alpha = 0.48
+        cv2.rectangle(overlay, (0, 0), (display.shape[1], 250), (0, 0, 0), -1)
+        alpha = 0.45
         display = cv2.addWeighted(overlay, alpha, display, 1 - alpha, 0)
+
+        bpm_info = f"{main_bpm:.0f} BPM ({main_bpm_quality})" if main_bpm is not None else "--"
+        temp_info = (
+            f"{main_apparent_temp:.1f} C ({main_temp_label})"
+            if main_apparent_temp is not None else "--"
+        )
+
+        info_lines = [
+            f"Personas: {face_count}",
+            f"Principal: {main_name if main_name else '--'}",
+            f"Ropa: {main_clothing_desc}",
+            f"Enrojecimiento: {main_redness_level}",
+            f"Temp aparente: {temp_info}",
+            f"Pulso aprox: {bpm_info}",
+            f"OCR: {', '.join(last_ocr_texts[:3]) if last_ocr_texts else '--'}",
+            "Q: salir"
+        ]
 
         draw_multiline_text(
             display,
-            overlay_lines,
+            info_lines,
             x=20,
             y=40,
-            line_height=32,
+            line_height=30,
             font_scale=0.85,
             color=(255, 255, 255),
             thickness=2
